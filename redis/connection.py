@@ -39,6 +39,7 @@ from ._defaults import (
     get_default_socket_keepalive_options,
 )
 from ._parsers import Encoder, _HiredisParser, _RESP2Parser, _RESP3Parser
+from ._parsers.hiredis import _socket_is_closed
 from .auth.token import TokenInterface
 from .backoff import NoBackoff
 from .credentials import CredentialProvider, UsernamePasswordCredentialProvider
@@ -243,6 +244,13 @@ class ConnectionInterface:
     def can_read(self, timeout: float = 0) -> bool:
         # TODO: Rename this API; it detects pending data or dirty/closed
         # connection state, not only whether application data can be read.
+        pass
+
+    @abstractmethod
+    def is_closed(self) -> bool:
+        # Non-destructive check for a peer-closed socket, distinct from
+        # can_read() which cannot tell pending data apart from a closed socket
+        # for the hiredis parser.
         pass
 
     @abstractmethod
@@ -1355,6 +1363,16 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             self.disconnect()
             raise ConnectionError(f"Error while reading from {host_error}: {e.args}")
 
+    def is_closed(self) -> bool:
+        # Non-destructive check for whether the peer has closed the connection.
+        # Used at pool checkout to recycle a stale connection without consuming
+        # pending push data, since the hiredis parser's can_read() reports a
+        # closed socket as readable and cannot tell "has data" from "closed".
+        sock = self._sock
+        if sock is None:
+            return True
+        return _socket_is_closed(sock)
+
     def read_response(
         self,
         disable_decoding=False,
@@ -1772,6 +1790,9 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
         # TODO: Rename this API; it detects pending data or dirty/closed
         # connection state, not only whether application data can be read.
         return self._conn.can_read(timeout)
+
+    def is_closed(self) -> bool:
+        return self._conn.is_closed()
 
     def read_response(
         self,
@@ -3120,6 +3141,19 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
             finally:
                 self._fork_lock.release()
 
+    def _connection_is_dirty(self, connection) -> bool:
+        # a pooled connection is dirty (and must be recycled) when it carries
+        # data we did not expect to find on checkout. with caching or
+        # maintenance notifications enabled a readable socket may just hold
+        # pending push messages, so it is not necessarily dirty; only a
+        # server-closed socket counts as dirty there. is_closed() is a
+        # non-destructive poll that leaves any pending push data intact.
+        if not connection.can_read():
+            return False
+        if self.cache is None and not self.maint_notifications_enabled():
+            return True
+        return connection.is_closed()
+
     @deprecated_args(
         args_to_warn=["*"],
         reason="Use get_connection() without args instead",
@@ -3166,16 +3200,16 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
             # pool before all data has been read or the socket has been
             # closed. either way, reconnect and verify everything is good.
             try:
-                if (
-                    connection.can_read()
-                    and self.cache is None
-                    and not self.maint_notifications_enabled()
-                ):
+                if self._connection_is_dirty(connection):
                     raise ConnectionError("Connection has data")
             except (ConnectionError, TimeoutError, OSError):
                 connection.disconnect()
                 connection.connect()
-                if connection.can_read():
+                # apply the same dirty check after reconnecting so a fresh
+                # connection holding legitimate pending push data (possible
+                # under RESP3 caching / maintenance notifications) is not
+                # wrongly rejected as "not ready".
+                if self._connection_is_dirty(connection):
                     raise ConnectionError("Connection not ready")
         except BaseException:
             # release the connection back to the pool so that we don't

@@ -16,7 +16,7 @@ import pytest
 import redis
 from redis import ConnectionPool, Redis
 from redis._parsers import _HiredisParser, _RESP2Parser, _RESP3Parser
-from redis._parsers.hiredis import NOT_ENOUGH_DATA, _socket_can_read
+from redis._parsers.hiredis import NOT_ENOUGH_DATA, _socket_can_read, _socket_is_closed
 from redis._parsers.socket import SocketBuffer
 from redis.backoff import NoBackoff
 from redis.cache import (
@@ -219,6 +219,84 @@ def test_hiredis_socket_can_read_under_fd_exhaustion():
         writable.close()
         empty_sock.close()
         peer.close()
+
+
+@pytest.mark.skipif(
+    not hasattr(select, "poll"), reason="select.poll not available on this platform"
+)
+def test_socket_is_closed_detects_peer_close():
+    # a peer-closed socket reads as ready (it yields EOF), so readiness alone
+    # cannot tell it apart from a socket holding pending data; _socket_is_closed()
+    # distinguishes them via POLLHUP without consuming data.
+    alive, peer = socket.socketpair()
+    closed, closing_peer = socket.socketpair()
+    try:
+        peer.sendall(b"pending push data")
+        closing_peer.close()
+
+        assert _socket_is_closed(alive) is False
+        assert _socket_is_closed(closed) is True
+    finally:
+        alive.close()
+        peer.close()
+        closed.close()
+
+
+def test_socket_is_closed_without_poll_reports_not_closed(monkeypatch):
+    # without select.poll (e.g. Windows) closed and has-data states are
+    # indistinguishable here, so we conservatively report not-closed.
+    monkeypatch.setattr("redis._parsers.hiredis._HAS_POLL", False)
+    closed, closing_peer = socket.socketpair()
+    try:
+        closing_peer.close()
+        assert _socket_is_closed(closed) is False
+    finally:
+        closed.close()
+
+
+def test_pool_recycles_closed_connection_with_maint_notifications():
+    # regression for #4128: with maintenance notifications (or client-side
+    # caching) enabled, get_connection() skips the "has data" dirty check since
+    # a readable socket may just hold pending push messages. a server-closed
+    # connection also reads as readable, so the pool must still recycle it via
+    # is_closed() instead of handing back a stale connection.
+    pool = ConnectionPool(connection_class=mock.Mock)
+    connection = mock.Mock()
+    # readable+closed on checkout, then clean after the pool reconnects it
+    connection.can_read.side_effect = [True, False]
+    connection.is_closed.return_value = True
+    pool._available_connections = [connection]
+
+    with patch.object(pool, "maint_notifications_enabled", return_value="auto"):
+        acquired = pool.get_connection()
+
+    assert acquired is connection
+    # closed connection detected -> recycled (disconnect + reconnect)
+    connection.disconnect.assert_called_once()
+    # connect(): once to ensure-connect, once after recycling the closed socket
+    assert connection.connect.call_count == 2
+
+
+def test_pool_accepts_reconnected_connection_with_pending_push():
+    # after recycling a closed connection under maintenance notifications, the
+    # freshly reconnected connection may legitimately hold pending push data
+    # (readable but not closed). the post-reconnect check must apply the same
+    # dirty rule as a normal checkout and accept it, not reject it as "not
+    # ready".
+    pool = ConnectionPool(connection_class=mock.Mock)
+    connection = mock.Mock()
+    # checkout: readable + closed -> recycle; after reconnect: readable but not
+    # closed (pending push) -> must be accepted
+    connection.can_read.side_effect = [True, True]
+    connection.is_closed.side_effect = [True, False]
+    pool._available_connections = [connection]
+
+    with patch.object(pool, "maint_notifications_enabled", return_value="auto"):
+        acquired = pool.get_connection()
+
+    assert acquired is connection
+    connection.disconnect.assert_called_once()
+    assert connection.connect.call_count == 2
 
 
 def test_hiredis_can_read_does_not_decide_disable_decoding():

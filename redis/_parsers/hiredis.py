@@ -52,6 +52,24 @@ def _socket_can_read(sock, timeout: float) -> bool:
         return bool(selector.select(timeout))
 
 
+def _socket_is_closed(sock) -> bool:
+    # A server-closed socket reads as ready (it yields EOF), so readiness alone
+    # cannot tell it apart from a socket holding pending data. poll() can:
+    # POLLHUP/POLLERR/POLLNVAL flag a closed/errored socket while a live socket
+    # with buffered data reports POLLIN only. Polling is non-destructive, so any
+    # pending push messages are left intact. Without poll() the two states are
+    # indistinguishable here, so report not-closed.
+    if not _HAS_POLL:
+        return False
+    poller = select.poll()
+    poller.register(sock, select.POLLIN)
+    events = poller.poll(0)
+    if not events:
+        return False
+    _, revents = events[0]
+    return bool(revents & (select.POLLHUP | select.POLLERR | select.POLLNVAL))
+
+
 class _HiredisReaderArgs(TypedDict, total=False):
     protocolError: Callable[[str], Exception]
     replyError: Callable[[str], Exception]
